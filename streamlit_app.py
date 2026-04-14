@@ -1,9 +1,6 @@
 import streamlit as st
-<<<<<<< HEAD
 st.title("🎈 My new Streamlit app")
 import streamlit as st
-=======
->>>>>>> 5ad72e2 (Dash)
 import requests
 import numpy as np
 import pandas as pd
