@@ -10,7 +10,7 @@ from streamlit_autorefresh import st_autorefresh
 # =========================
 # CONFIG
 # =========================
-st.set_page_config(page_title="Peru Quant Dashboard v3", layout="wide")
+st.set_page_config(page_title="Peru Quant Dashboard v4", layout="wide")
 
 REFRESH = 10000
 BANKROLL = st.sidebar.number_input("Bankroll ($)", 10, 1_000_000, 90)
@@ -52,16 +52,9 @@ def fetch():
 data = fetch()
 
 # =========================
-# SAFE PARSERS (ROBUST)
+# SAFE PARSER
 # =========================
-def parse_list(x):
-    """
-    Handles:
-    - list
-    - JSON string list
-    - malformed string
-    - None
-    """
+def parse_any(x):
     if x is None:
         return []
 
@@ -69,32 +62,15 @@ def parse_list(x):
         return x
 
     if isinstance(x, str):
-        # try JSON
         try:
-            v = json.loads(x)
-            if isinstance(v, list):
-                return v
+            return json.loads(x)
         except:
-            pass
-
-        # fallback ast
-        try:
-            v = ast.literal_eval(x)
-            if isinstance(v, list):
-                return v
-        except:
-            pass
+            try:
+                return ast.literal_eval(x)
+            except:
+                return []
 
     return []
-
-def to_float_list(x):
-    out = []
-    for i in parse_list(x):
-        try:
-            out.append(float(i))
-        except:
-            continue
-    return out
 
 # =========================
 # FEATURES
@@ -125,7 +101,7 @@ def imbalance(p):
     return np.max(p) - np.min(p)
 
 # =========================
-# MODEL (ANCHOR + DYNAMICS)
+# MODEL
 # =========================
 def model_delta(features):
     mom, vol, ent, imb, gam, delt, mkt = features
@@ -152,6 +128,57 @@ def kelly(p, q):
     return max(0, min(k * 0.4, 0.25))
 
 # =========================
+# SAFE MARKET PARSER (CRITICAL FIX)
+# =========================
+def extract_outcomes_and_prices(market):
+
+    outcomes_raw = market.get("outcomes", [])
+
+    outcomes = []
+    prices = []
+
+    # CASE 1: structured dict outcomes (MOST COMMON GAMMA FIX)
+    if isinstance(outcomes_raw, list) and len(outcomes_raw) > 0 and isinstance(outcomes_raw[0], dict):
+
+        for o in outcomes_raw:
+            name = o.get("title") or o.get("name") or "unknown"
+
+            price = (
+                o.get("price")
+                or o.get("probability")
+                or o.get("p")
+            )
+
+            try:
+                price = float(price)
+            except:
+                continue
+
+            outcomes.append(name)
+            prices.append(price)
+
+        return outcomes, prices
+
+    # CASE 2: fallback flat parsing
+    parsed = parse_any(outcomes_raw)
+
+    if isinstance(parsed, list):
+        for i in parsed:
+            if isinstance(i, dict):
+                name = i.get("title") or i.get("name")
+                price = i.get("price") or i.get("probability")
+
+                try:
+                    price = float(price)
+                except:
+                    continue
+
+                outcomes.append(name)
+                prices.append(price)
+
+    return outcomes, prices
+
+# =========================
 # BUILD DATASET
 # =========================
 rows = []
@@ -166,8 +193,7 @@ for event in data:
 
     for market in markets:
 
-        outcomes = parse_list(market.get("outcomes", []))
-        prices = to_float_list(market.get("outcomePrices", []))
+        outcomes, prices = extract_outcomes_and_prices(market)
 
         # DEBUG SAFETY
         if len(outcomes) == 0 or len(prices) == 0:
@@ -187,7 +213,6 @@ for event in data:
 
             mkt = float(p)
 
-            # relaxed filter (avoid zero output)
             if mkt < 0.01 or mkt > 0.99:
                 continue
 
@@ -227,24 +252,25 @@ for event in data:
 df = pd.DataFrame(rows)
 
 # =========================
-# DEBUG VIEW (IMPORTANT)
+# DEBUG OUTPUT
 # =========================
 st.write("Events:", len(data))
 st.write("Signals:", len(df))
 
 if df.empty:
-    st.warning("No signals generated → check Gamma API structure or outcomes/prices mapping")
+    st.warning("No signals → Gamma schema mismatch or empty markets")
+    st.json(data[0]["markets"][0])
     st.stop()
 
 # =========================
-# RANKING SYSTEM
+# RANKING
 # =========================
 df = df.sort_values("edge", ascending=False)
 
 # =========================
 # DASHBOARD
 # =========================
-st.title("🇵🇪 Peru Quant Dashboard v3 — Stable Gamma Model")
+st.title("🇵🇪 Peru Quant Dashboard v4 — Stable Gamma Parser")
 
 c1, c2, c3 = st.columns(3)
 
