@@ -17,7 +17,7 @@ KELLY_FRACTION = st.sidebar.slider("Kelly fraction", 0.0, 1.0, 0.25)
 
 MIN_BET = 1
 MAX_BET_FRAC = 0.10
-MIN_EDGE = 0.02
+MIN_EDGE = 0.005
 
 st_autorefresh(interval=REFRESH, key="refresh")
 
@@ -115,7 +115,7 @@ def kelly(p, q):
     edge = p - q
     var = q * (1 - q) + 1e-6
     k = edge / var
-    return max(0, min(k * 0.3, 0.05))
+    return max(0, min(k * 0.5, 0.15))
 
 # =========================
 # BUILD DATASET
@@ -154,7 +154,7 @@ for event in data:
             mkt = float(p)
 
             # FILTER MARKET EXTREMES
-            if mkt < 0.05 or mkt > 0.95:
+            if mkt < 0.01 or mkt > 0.99:
                 continue
 
             features = (
