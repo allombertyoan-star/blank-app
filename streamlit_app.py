@@ -3,23 +3,23 @@ import requests
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import json
 import ast
 from streamlit_autorefresh import st_autorefresh
 
 # =========================
 # CONFIG
 # =========================
-st.set_page_config(page_title="Peru Quant Dashboard v2", layout="wide")
+st.set_page_config(page_title="Peru Quant Dashboard v3", layout="wide")
 
 REFRESH = 10000
 BANKROLL = st.sidebar.number_input("Bankroll ($)", 10, 1_000_000, 90)
 KELLY_FRACTION = st.sidebar.slider("Kelly fraction", 0.0, 1.0, 0.25)
 
-MIN_BET = 1
 st_autorefresh(interval=REFRESH, key="refresh")
 
 # =========================
-# GAMMA API
+# API
 # =========================
 SLUGS = [
     "peru-presidential-election-first-round-2nd-place",
@@ -52,20 +52,44 @@ def fetch():
 data = fetch()
 
 # =========================
-# SAFE PARSER
+# SAFE PARSERS (ROBUST)
 # =========================
-def safe(x):
-    if isinstance(x, list):
-        return x
-    try:
-        return ast.literal_eval(x)
-    except:
+def parse_list(x):
+    """
+    Handles:
+    - list
+    - JSON string list
+    - malformed string
+    - None
+    """
+    if x is None:
         return []
 
+    if isinstance(x, list):
+        return x
+
+    if isinstance(x, str):
+        # try JSON
+        try:
+            v = json.loads(x)
+            if isinstance(v, list):
+                return v
+        except:
+            pass
+
+        # fallback ast
+        try:
+            v = ast.literal_eval(x)
+            if isinstance(v, list):
+                return v
+        except:
+            pass
+
+    return []
+
 def to_float_list(x):
-    x = safe(x)
     out = []
-    for i in x:
+    for i in parse_list(x):
         try:
             out.append(float(i))
         except:
@@ -73,17 +97,14 @@ def to_float_list(x):
     return out
 
 # =========================
-# FEATURES (robustes)
+# FEATURES
 # =========================
 def momentum(p):
     p = np.array(p)
     return np.mean(np.diff(p)) if len(p) > 1 else 0
 
 def volatility(p):
-    p = np.std(p)
-
-    # regime correction
-    return np.tanh(p)
+    return np.tanh(np.std(p))
 
 def gamma_feature(p):
     p = np.array(p)
@@ -104,17 +125,16 @@ def imbalance(p):
     return np.max(p) - np.min(p)
 
 # =========================
-# MODEL (RESIDUAL + REGIME)
+# MODEL (ANCHOR + DYNAMICS)
 # =========================
 def model_delta(features):
-    mom, vol, ent, dom, imb, gam, delt, mkt = features
+    mom, vol, ent, imb, gam, delt, mkt = features
 
     signal = (
         0.20 * mom +
-        0.15 * gam +
+        0.20 * gam +
         0.15 * delt +
-        0.15 * dom +
-        0.10 * imb +
+        0.15 * imb +
         -0.20 * vol +
         -0.10 * ent +
         0.10 * (0.5 - abs(mkt - 0.5))
@@ -123,13 +143,13 @@ def model_delta(features):
     return 0.5 * np.tanh(signal)
 
 # =========================
-# KELLY (stabilisé)
+# KELLY
 # =========================
 def kelly(p, q):
     edge = p - q
     var = q * (1 - q) + 1e-6
     k = edge / var
-    return max(0, min(k * 0.4, 0.2))
+    return max(0, min(k * 0.4, 0.25))
 
 # =========================
 # BUILD DATASET
@@ -146,15 +166,16 @@ for event in data:
 
     for market in markets:
 
-        outcomes = safe(market.get("outcomes", []))
-        prices_raw = market.get("outcomePrices", [])
+        outcomes = parse_list(market.get("outcomes", []))
+        prices = to_float_list(market.get("outcomePrices", []))
 
-        prices = to_float_list(prices_raw)
+        # DEBUG SAFETY
+        if len(outcomes) == 0 or len(prices) == 0:
+            continue
 
         if len(prices) < 3:
             continue
 
-        # FEATURES
         mom = momentum(prices)
         vol = volatility(prices)
         gam = gamma_feature(prices)
@@ -166,7 +187,7 @@ for event in data:
 
             mkt = float(p)
 
-            # soft clamp (avoid useless extremes only)
+            # relaxed filter (avoid zero output)
             if mkt < 0.01 or mkt > 0.99:
                 continue
 
@@ -175,24 +196,18 @@ for event in data:
                 vol,
                 ent,
                 imb,
-                imb,
                 gam,
                 delt,
                 mkt
             )
 
             delta = model_delta(features)
-
-            # ANCHOR MARKET (important fix)
             model_prob = np.clip(mkt + delta, 0, 1)
 
             edge = model_prob - mkt
 
-            # IMPORTANT: no hard filtering → ranking system
             k = kelly(model_prob, mkt)
-
             bet = BANKROLL * k * KELLY_FRACTION
-            bet = max(bet, 0)
 
             rows.append({
                 "candidate": o,
@@ -212,30 +227,30 @@ for event in data:
 df = pd.DataFrame(rows)
 
 # =========================
-# DEBUG SAFE MODE
+# DEBUG VIEW (IMPORTANT)
 # =========================
 st.write("Events:", len(data))
 st.write("Signals:", len(df))
 
 if df.empty:
-    st.warning("No data from API or parsing issue (check Gamma response structure)")
+    st.warning("No signals generated → check Gamma API structure or outcomes/prices mapping")
     st.stop()
 
 # =========================
-# RANKING SYSTEM (IMPORTANT CHANGE)
+# RANKING SYSTEM
 # =========================
 df = df.sort_values("edge", ascending=False)
 
 # =========================
 # DASHBOARD
 # =========================
-st.title("🇵🇪 Peru Quant Dashboard — Gamma Enhanced Model")
+st.title("🇵🇪 Peru Quant Dashboard v3 — Stable Gamma Model")
 
 c1, c2, c3 = st.columns(3)
 
 c1.metric("Max Edge", f"{df['edge'].max():.4f}")
 c2.metric("Avg Gamma", f"{df['gamma'].mean():.4f}")
-c3.metric("Total Exposure", f"{df['bet'].sum():.2f}$")
+c3.metric("Exposure", f"{df['bet'].sum():.2f}$")
 
 st.subheader("Top Opportunities")
 st.dataframe(df, use_container_width=True)
