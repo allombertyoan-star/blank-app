@@ -16,18 +16,17 @@ st.title("🎈 My new Streamlit app")
 
 REFRESH = 10000
 
-# 🔴 bankroll adaptée micro-capital
 BANKROLL = st.sidebar.number_input("Bankroll ($)", 10, 1_000_000, 90)
 KELLY_FRACTION = st.sidebar.slider("Kelly fraction", 0.0, 1.0, 0.25)
 
 MIN_BET = 1
 MAX_BET_FRAC = 0.10
-MIN_EDGE = 0.0   # IMPORTANT FIX: sinon tu bloques tout sur marchés biaisés
+MIN_EDGE = 0.0
 
 st_autorefresh(interval=REFRESH, key="refresh")
 
 # =========================
-# FETCH (SLUG DIRECT)
+# FETCH
 # =========================
 SLUGS = [
     "peru-presidential-election-first-round-2nd-place",
@@ -39,11 +38,9 @@ BASE = "https://gamma-api.polymarket.com/events/slug/"
 @st.cache_data(ttl=30)
 def fetch():
     events = []
-
     for slug in SLUGS:
         try:
             r = requests.get(BASE + slug, timeout=10)
-
             if r.status_code != 200:
                 continue
 
@@ -51,7 +48,6 @@ def fetch():
 
             if isinstance(data, dict):
                 events.append(data)
-
             elif isinstance(data, list):
                 events.extend([e for e in data if isinstance(e, dict)])
 
@@ -63,15 +59,13 @@ def fetch():
 data = fetch()
 
 # =========================
-# SAFE PARSE (CRITICAL FIX)
+# SAFE PARSE
 # =========================
 def safe(x):
     if x is None:
         return []
-
     if isinstance(x, list):
         return x
-
     if isinstance(x, str):
         try:
             return json.loads(x)
@@ -80,7 +74,6 @@ def safe(x):
                 return ast.literal_eval(x)
             except:
                 return []
-
     return []
 
 def to_float_list(x):
@@ -93,57 +86,99 @@ def to_float_list(x):
     return out
 
 # =========================
-# FEATURES (LEVEL 2)
+# FEATURES
 # =========================
-def momentum(prices):
-    p = np.array(prices)
-    return np.mean(np.diff(p)) if len(p) > 1 else 0
+def momentum(p): return np.mean(np.diff(p)) if len(p) > 1 else 0
+def volatility(p): return np.std(p)
 
-def volatility(prices):
-    return np.std(prices)
-
-def entropy(prices):
-    p = np.array(prices)
-    p = np.clip(p, 1e-6, 1)
+def entropy(p):
+    p = np.clip(np.array(p), 1e-6, 1)
     p = p / np.sum(p)
     return -np.sum(p * np.log(p + 1e-9))
 
-def dominance(prices):
+def dominance(p): return np.max(p) - np.mean(p)
+def imbalance(p): return np.max(p) - np.min(p)
+
+# =========================
+# REGIME
+# =========================
+def market_regime(prices):
     p = np.array(prices)
-    return np.max(p) - np.mean(p)
-
-def imbalance(prices):
-    p = np.array(prices)
-    return np.max(p) - np.min(p)
+    return np.std(p) + abs(np.mean(p) - 0.5)
 
 # =========================
-# MODEL (LEVEL 3 SIMPLIFIED)
+# BAYES / CONFIDENCE
 # =========================
-def model_prob(market_prob, mom, vol, ent, dom, imb):
+def confidence_score(ent, vol):
+    base = 1 / (1 + ent + vol)
+    return np.clip(base, 0.1, 1.0)
 
-    signal = (
-        0.35 * market_prob +
-        0.15 * (0.5 + np.tanh(mom)) +
-        0.15 * (1 - vol) +
-        0.15 * (1 - ent) +
-        0.10 * dom +
-        0.10 * imb
-    )
-
-    return 0.7 * signal + 0.3 * 0.5
+def bayesian_shrinkage(model_p, market_p, confidence):
+    return confidence * model_p + (1 - confidence) * market_p
 
 # =========================
-# SAFE KELLY
+# KELLY (VARIANCE-AWARE)
 # =========================
-def safe_kelly(p, q):
-
+def variance_kelly(p, q, signal_var):
     if p <= q:
         return 0
 
     k = (p - q) / (1 - q + 1e-6)
-    k = k * 0.5
+    risk_adj = 1 / (1 + 5 * signal_var)
 
+    k = k * risk_adj
     return max(0, min(k, 0.05))
+
+# =========================
+# MODEL (LOGIT + REGIME)
+# =========================
+def model_prob(market_prob, mom, vol, ent, dom, imb, prices):
+
+    regime = market_regime(prices)
+
+    skew_adj = np.tanh(2 * (0.5 - abs(market_prob - 0.5)))
+
+    mom_n = np.tanh(mom)
+    dom_n = np.tanh(dom)
+    imb_n = np.tanh(imb)
+    ent_n = 1 - np.tanh(ent)
+    vol_n = 1 - np.tanh(vol)
+
+    raw = (
+        0.25 * mom_n +
+        0.20 * dom_n +
+        0.20 * imb_n +
+        0.20 * ent_n +
+        0.15 * vol_n
+    )
+
+    raw = raw / (1 + regime)
+
+    logit = np.log((market_prob + 1e-6) / (1 - market_prob + 1e-6))
+    logit = logit + 0.8 * raw
+
+    prob = 1 / (1 + np.exp(-logit))
+    prob = prob * skew_adj + market_prob * (1 - skew_adj)
+
+    return np.clip(prob, 1e-4, 1 - 1e-4)
+
+# =========================
+# ARBITRAGE DETECTION
+# =========================
+def detect_arbitrage(df):
+    if df.empty:
+        return []
+
+    grouped = df.groupby("candidate")["model_prob"].mean()
+    mean = grouped.mean()
+
+    out = []
+    for c, p in grouped.items():
+        dev = p - mean
+        if abs(dev) > 0.15:
+            out.append({"candidate": c, "arb_signal": dev})
+
+    return out
 
 # =========================
 # BUILD DATA
@@ -151,27 +186,14 @@ def safe_kelly(p, q):
 rows = []
 
 for event in data:
-
     if not isinstance(event, dict):
         continue
 
-    markets = event.get("markets", [])
-
-    if not isinstance(markets, list):
-        continue
-
-    for market in markets:
-
-        # =========================
-        # 🔴 CRITICAL FIX HERE
-        # =========================
-        outcomes = safe(market.get("outcomes", []))
-        prices = to_float_list(market.get("outcomePrices", []))
+    for market in event.get("markets", []):
+        outcomes = safe(market.get("outcomes"))
+        prices = to_float_list(market.get("outcomePrices"))
 
         if len(outcomes) == 0 or len(prices) == 0:
-            continue
-
-        if len(prices) < 2:
             continue
 
         mom = momentum(prices)
@@ -183,18 +205,23 @@ for event in data:
         for o, p in zip(outcomes, prices):
 
             m_prob = float(p)
-            mod_prob = model_prob(m_prob, mom, vol, ent, dom, imb)
+
+            mod_prob = model_prob(m_prob, mom, vol, ent, dom, imb, prices)
+
+            conf = confidence_score(ent, vol)
+
+            mod_prob = bayesian_shrinkage(mod_prob, m_prob, conf)
+
+            signal_var = np.var([mom, vol, ent, dom, imb])
 
             edge = mod_prob - m_prob
 
-            # 🔴 FILTER SOFTENED (IMPORTANT FIX FOR "NO SIGNALS")
             if edge < MIN_EDGE:
                 continue
 
-            kelly = safe_kelly(mod_prob, m_prob)
+            kelly = variance_kelly(mod_prob, m_prob, signal_var)
 
             bet = BANKROLL * kelly * KELLY_FRACTION
-
             bet = min(bet, BANKROLL * MAX_BET_FRAC)
 
             if bet < MIN_BET:
@@ -205,12 +232,6 @@ for event in data:
                 "market_prob": m_prob,
                 "model_prob": mod_prob,
                 "edge": edge,
-                "momentum": mom,
-                "volatility": vol,
-                "entropy": ent,
-                "dominance": dom,
-                "imbalance": imb,
-                "kelly": kelly,
                 "bet": round(bet, 2)
             })
 
@@ -220,7 +241,7 @@ df = pd.DataFrame(rows)
 # EMPTY CASE
 # =========================
 if df.empty:
-    st.warning("No valid bets (Gamma parsing OK but market too skewed or filtered)")
+    st.warning("No valid bets")
     st.stop()
 
 df = df.sort_values("edge", ascending=False)
@@ -231,53 +252,30 @@ df = df.sort_values("edge", ascending=False)
 st.title("🇵🇪 Peru Election Quant Dashboard")
 
 col1, col2, col3 = st.columns(3)
-
 col1.metric("Max Edge", f"{df['edge'].max():.4f}")
-col2.metric("Avg Entropy", f"{df['entropy'].mean():.4f}")
-col3.metric("Total Exposure", f"{df['bet'].sum():.2f} $")
+col2.metric("Avg Edge", f"{df['edge'].mean():.4f}")
+col3.metric("Exposure", f"{df['bet'].sum():.2f} $")
 
-# =========================
-# TABLE
-# =========================
 st.subheader("Opportunities")
-st.dataframe(df, width="stretch")
+st.dataframe(df, use_container_width=True)
 
-# =========================
-# EDGE BAR
-# =========================
-fig = px.bar(
-    df,
-    x="candidate",
-    y="edge",
-    color="edge",
-    title="Edge per Candidate"
-)
+st.plotly_chart(px.bar(df, x="candidate", y="edge", color="edge"))
 
-st.plotly_chart(fig, key="edge_bar_unique")
-
-# =========================
-# SCATTER
-# =========================
-fig2 = px.scatter(
+st.plotly_chart(px.scatter(
     df,
     x="market_prob",
     y="model_prob",
     size="bet",
     color="edge",
-    hover_name="candidate",
-    title="Market vs Model"
-)
+    hover_name="candidate"
+))
 
-st.plotly_chart(fig2, key="scatter_unique")
+st.plotly_chart(px.histogram(df, x="edge", nbins=20))
 
 # =========================
-# DISTRIBUTION
+# ARBITRAGE PANEL
 # =========================
-fig3 = px.histogram(
-    df,
-    x="edge",
-    nbins=20,
-    title="Edge Distribution"
-)
-
-st.plotly_chart(fig3, key="hist_unique")
+arb = detect_arbitrage(df)
+if arb:
+    st.subheader("⚡ Arbitrage Signals")
+    st.dataframe(pd.DataFrame(arb))
